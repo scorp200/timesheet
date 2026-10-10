@@ -1,0 +1,4 @@
+# Link the Visual C++ runtime statically so timesheet.exe runs on a clean Windows
+# install without needing VCRUNTIME140.dll (the VC++ Redistributable).
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "target-feature=+crt-static"]
