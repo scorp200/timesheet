@@ -13,20 +13,21 @@ jobs:
     permissions:
       contents: write # to attach the exe to releases
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
       - run: cargo test --release
       - run: cargo build --release
 
-      - uses: actions/upload-artifact@v4
+      # Uploaded unzipped, so the artifact downloads as timesheet.exe itself.
+      - uses: actions/upload-artifact@v7
         with:
-          name: timesheet-windows
           path: target/release/timesheet.exe
+          archive: false
 
       # Pushing a tag like v1.0.0 publishes a GitHub release with the exe attached.
       - if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: target/release/timesheet.exe
