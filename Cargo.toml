@@ -1,0 +1,22 @@
+[package]
+name = "timesheet"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+chrono = { version = "0.4.45", features = ["serde"] }
+# Default features minus "links" (opens URLs in a browser) and "web_screen_reader" (wasm only),
+# so nothing in the app can reach the network.
+eframe = { version = "0.36.2", default-features = false, features = [
+    "accesskit",
+    "default_fonts",
+    "persistence",
+    "wayland",
+    "wgpu",
+    "x11",
+] }
+# Keeps winit's default features (eframe's "winit/default"), e.g. Wayland window decorations on Linux.
+winit = "0.30.13"
+rfd = "0.17.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.152"
