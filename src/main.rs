@@ -169,6 +169,12 @@ fn text_color_for(bg: Color32) -> Color32 {
     }
 }
 
+/// A shade of `color` that stands out against it, shifted toward its text color:
+/// darker for light colors, lighter for dark ones.
+fn border_color_for(color: Color32) -> Color32 {
+    color.lerp_to_gamma(text_color_for(color), 0.35)
+}
+
 impl TimesheetApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let settings = Settings::load();
@@ -810,6 +816,17 @@ impl TimesheetApp {
             );
         }
 
+        // Grid lines, drawn under the blocks so they don't cut through them.
+        for slot in 0..=SLOTS_PER_DAY {
+            let y = rect.top() + slot as f32 * ROW_H;
+            let color = if slot % 4 == 0 { line_hour } else { line_faint };
+            painter.hline(grid_left..=rect.right(), y, Stroke::new(1.0, color));
+        }
+        for col in 0..=7 {
+            let x = grid_left + col as f32 * col_w;
+            painter.vline(x, rect.y_range(), Stroke::new(1.0, line_hour));
+        }
+
         // Project blocks, merged into contiguous runs so labels show once.
         for (col, date) in dates.iter().enumerate() {
             let Some(day) = self.data.days.get(date) else {
@@ -835,7 +852,13 @@ impl TimesheetApp {
                 )
                 .shrink2(Vec2::new(2.0, 1.0));
                 let color = project.color32();
-                painter.rect_filled(block, CornerRadius::same(3), color);
+                painter.rect(
+                    block,
+                    CornerRadius::same(3),
+                    color,
+                    Stroke::new(1.0, border_color_for(color)),
+                    StrokeKind::Inside,
+                );
                 painter.with_clip_rect(block.intersect(rect)).text(
                     block.left_top() + Vec2::new(4.0, 2.0),
                     Align2::LEFT_TOP,
@@ -844,17 +867,6 @@ impl TimesheetApp {
                     text_color_for(color),
                 );
             }
-        }
-
-        // Grid lines.
-        for slot in 0..=SLOTS_PER_DAY {
-            let y = rect.top() + slot as f32 * ROW_H;
-            let color = if slot % 4 == 0 { line_hour } else { line_faint };
-            painter.hline(grid_left..=rect.right(), y, Stroke::new(1.0, color));
-        }
-        for col in 0..=7 {
-            let x = grid_left + col as f32 * col_w;
-            painter.vline(x, rect.y_range(), Stroke::new(1.0, line_hour));
         }
 
         // Hover highlight + tool indicator on the cursor.
