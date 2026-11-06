@@ -2,8 +2,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod storage;
+mod theme;
+mod widgets;
 
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{collections::BTreeMap, ops::Range, path::PathBuf};
 
 use chrono::{Datelike, Duration, Local, NaiveDate, Timelike};
 use eframe::egui::{
@@ -12,12 +14,17 @@ use eframe::egui::{
 };
 use serde::{Deserialize, Serialize};
 use storage::{Settings, Theme};
+use theme::{border_color_for, text_color_for};
+use widgets::{FlatButton, ProgressTrack, button, dialog_header, text_field};
 
 const SLOTS_PER_DAY: usize = 24 * 4;
 const ROW_H: f32 = 18.0;
 const HEADER_H: f32 = 40.0;
 const GUTTER_W: f32 = 80.0;
 const WEEK_TARGET_HOURS: f32 = 40.0;
+/// Shown for the eraser tool. Icons must have a drawn glyph in egui's bundled fonts:
+/// some characters (like ✕) are listed by a font but drawn as nothing.
+const ERASER_ICON: &str = "🗙";
 /// Key data was stored under in eframe storage by earlier versions; read once for migration.
 const LEGACY_STORAGE_KEY: &str = "timesheet";
 
@@ -71,7 +78,7 @@ impl Data {
             .entry(date)
             .or_insert_with(|| vec![None; SLOTS_PER_DAY]);
         day[slot] = value;
-        if day.iter().all(Option::is_none) {
+        if is_empty_day(day) {
             self.days.remove(&date);
         }
     }
@@ -102,13 +109,17 @@ impl Data {
 
     fn delete_project(&mut self, id: u64) {
         self.projects.retain(|p| p.id != id);
-        for day in self.days.values_mut() {
+        self.days.retain(|_, day| {
             for slot in day.iter_mut().filter(|s| **s == Some(id)) {
                 *slot = None;
             }
-        }
-        self.days.retain(|_, d| d.iter().any(Option::is_some));
+            !is_empty_day(day)
+        });
     }
+}
+
+fn is_empty_day(day: &[Option<u64>]) -> bool {
+    day.iter().all(Option::is_none)
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -119,8 +130,45 @@ enum Tool {
 
 /// An in-progress paint drag.
 struct PaintStroke {
+    /// What every slot the drag passes over is set to; `None` erases.
     value: Option<u64>,
     last: (usize, usize),
+}
+
+/// Screen geometry of the week grid.
+#[derive(Clone, Copy)]
+struct GridGeom {
+    /// The whole grid, including the time gutter on the left.
+    rect: Rect,
+    col_w: f32,
+}
+
+impl GridGeom {
+    /// Left edge of the first day column.
+    fn left(&self) -> f32 {
+        self.rect.left() + GUTTER_W
+    }
+
+    fn col_x(&self, col: usize) -> f32 {
+        self.left() + col as f32 * self.col_w
+    }
+
+    /// The area covered by `rows` in day column `col`.
+    fn cells(&self, col: usize, rows: Range<usize>) -> Rect {
+        Rect::from_min_size(
+            Pos2::new(self.col_x(col), self.rect.top() + rows.start as f32 * ROW_H),
+            Vec2::new(self.col_w, rows.len() as f32 * ROW_H),
+        )
+    }
+
+    /// The (day, slot) under `pos`, clamped to the grid.
+    fn cell_at(&self, pos: Pos2) -> (usize, usize) {
+        let col = ((pos.x - self.left()) / self.col_w).floor().clamp(0.0, 6.0) as usize;
+        let row = ((pos.y - self.rect.top()) / ROW_H)
+            .floor()
+            .clamp(0.0, SLOTS_PER_DAY as f32 - 1.0) as usize;
+        (col, row)
+    }
 }
 
 struct TimesheetApp {
@@ -145,8 +193,28 @@ fn monday_of(date: NaiveDate) -> NaiveDate {
     date - Duration::days(date.weekday().num_days_from_monday() as i64)
 }
 
+fn slots_to_hours(slots: usize) -> f32 {
+    slots as f32 / 4.0
+}
+
 fn hours(slots: usize) -> String {
-    format!("{:.2} h", slots as f32 / 4.0)
+    format!("{:.2} h", slots_to_hours(slots))
+}
+
+/// Minutes since local midnight, right now.
+fn now_minutes() -> f32 {
+    let now = Local::now();
+    now.hour() as f32 * 60.0 + now.minute() as f32
+}
+
+/// Vertical offset of a time of day within the grid.
+fn minutes_to_y(minutes: f32) -> f32 {
+    minutes / 15.0 * ROW_H
+}
+
+/// Converts a 0..24 hour to 12-hour form, e.g. `13` to `(1, "PM")`.
+fn twelve_hour(h: usize) -> (usize, &'static str) {
+    ((h + 11) % 12 + 1, if h < 12 { "AM" } else { "PM" })
 }
 
 /// Formats minutes since midnight, e.g. `14:30` or `2:30 PM`.
@@ -155,30 +223,26 @@ fn clock(minutes: usize, clock_24h: bool) -> String {
     if clock_24h {
         format!("{h:02}:{m:02}")
     } else {
-        let suffix = if h < 12 { "AM" } else { "PM" };
-        format!("{}:{m:02} {suffix}", (h + 11) % 12 + 1)
+        let (h, suffix) = twelve_hour(h);
+        format!("{h}:{m:02} {suffix}")
     }
 }
 
-fn text_color_for(bg: Color32) -> Color32 {
-    let lum = 0.299 * bg.r() as f32 + 0.587 * bg.g() as f32 + 0.114 * bg.b() as f32;
-    if lum > 150.0 {
-        Color32::BLACK
+/// Label for the start of an hour in the grid gutter, e.g. `14:00` or `2 PM`.
+fn hour_label(hour: usize, clock_24h: bool) -> String {
+    if clock_24h {
+        clock(hour * 60, true)
     } else {
-        Color32::WHITE
+        let (h, suffix) = twelve_hour(hour);
+        format!("{h} {suffix}")
     }
-}
-
-/// A shade of `color` that stands out against it, shifted toward its text color:
-/// darker for light colors, lighter for dark ones.
-fn border_color_for(color: Color32) -> Color32 {
-    color.lerp_to_gamma(text_color_for(color), 0.35)
 }
 
 impl TimesheetApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let settings = Settings::load();
         cc.egui_ctx.set_theme(settings.theme);
+        theme::install(&cc.egui_ctx);
         let mut app = Self {
             data: Data::default(),
             week_start: monday_of(Local::now().date_naive()),
@@ -203,8 +267,7 @@ impl TimesheetApp {
         let backup = storage::backup_path(&dir);
         match storage::read_json::<Data>(&path) {
             Ok(Some(data)) => {
-                self.last_saved = serde_json::to_vec_pretty(&data).unwrap_or_default();
-                self.data = data;
+                self.adopt_data(data);
                 // Known-good copy to fall back on if the file is ever damaged.
                 let _ = storage::write_bytes(&backup, &self.last_saved);
             }
@@ -223,10 +286,8 @@ impl TimesheetApp {
                     return;
                 };
                 // Keep the damaged file for inspection rather than overwriting it.
-                let damaged = dir.join(format!(
-                    "timesheet.damaged-{}.json",
-                    Local::now().format("%Y%m%d-%H%M%S")
-                ));
+                let stamp = Local::now().format("%Y%m%d-%H%M%S").to_string();
+                let damaged = storage::damaged_path(&dir, &stamp);
                 if let Err(e) = std::fs::rename(&path, &damaged) {
                     self.block_saving(&path, &e);
                     return;
@@ -241,6 +302,12 @@ impl TimesheetApp {
             }
             Err(e) => self.block_saving(&path, &e),
         }
+    }
+
+    /// Replaces the in-memory data with what was just read from disk.
+    fn adopt_data(&mut self, data: Data) {
+        self.last_saved = serde_json::to_vec_pretty(&data).unwrap_or_default();
+        self.data = data;
     }
 
     /// Refuses to save so an unreadable data file is never overwritten.
@@ -264,7 +331,7 @@ impl TimesheetApp {
             .show(ctx, |ui| {
                 ui.label(notice);
                 ui.add_space(8.0);
-                dismissed = ui.button("OK").clicked();
+                dismissed = button(ui, "OK").clicked();
             });
         if dismissed {
             self.notice = None;
@@ -308,16 +375,16 @@ impl TimesheetApp {
         let path = storage::data_path(&new_dir);
         match storage::read_json::<Data>(&path) {
             Ok(Some(data)) => {
-                self.last_saved = serde_json::to_vec_pretty(&data).unwrap_or_default();
-                self.data = data;
+                self.adopt_data(data);
                 self.tool = None;
             }
             Ok(None) => {
-                if let Err(e) = storage::write_json(&path, &self.data) {
+                let json = serde_json::to_vec_pretty(&self.data).unwrap_or_default();
+                if let Err(e) = storage::write_bytes(&path, &json) {
                     self.error = Some(format!("Couldn't write to {}: {e}", new_dir.display()));
                     return;
                 }
-                self.last_saved = serde_json::to_vec_pretty(&self.data).unwrap_or_default();
+                self.last_saved = json;
             }
             Err(e) => {
                 self.error = Some(format!("Couldn't read {}: {e}", path.display()));
@@ -331,14 +398,18 @@ impl TimesheetApp {
     }
 
     fn settings_window(&mut self, ctx: &egui::Context) {
-        let mut open = self.show_settings;
+        if !self.show_settings {
+            return;
+        }
+        let mut close = false;
         let mut new_dir = None;
         egui::Window::new("Settings")
-            .open(&mut open)
-            .collapsible(false)
+            .title_bar(false)
             .resizable(false)
             .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
+                close =
+                    dialog_header(ui, "Settings") || ui.input(|i| i.key_pressed(egui::Key::Escape));
                 let before = self.settings.clone();
 
                 ui.strong("Theme");
@@ -350,8 +421,7 @@ impl TimesheetApp {
 
                 ui.add_space(8.0);
                 ui.strong("Clock");
-                let now = Local::now();
-                let minutes = (now.hour() * 60 + now.minute()) as usize;
+                let minutes = now_minutes() as usize;
                 ui.radio_value(
                     &mut self.settings.clock_24h,
                     true,
@@ -380,23 +450,22 @@ impl TimesheetApp {
                     }
                 });
                 ui.horizontal(|ui| {
-                    if ui.button("Choose…").clicked() {
-                        if let Some(picked) =
+                    if button(ui, "Choose…").clicked()
+                        && let Some(picked) =
                             rfd::FileDialog::new().set_directory(&dir).pick_folder()
-                        {
-                            new_dir = Some(Some(picked));
-                        }
+                    {
+                        new_dir = Some(Some(picked));
                     }
                     if ui
                         .add_enabled(
                             self.settings.data_dir.is_some(),
-                            egui::Button::new("Use default"),
+                            FlatButton::new("Use default"),
                         )
                         .clicked()
                     {
                         new_dir = Some(None);
                     }
-                    if ui.button("Open").clicked() {
+                    if button(ui, "Open").clicked() {
                         storage::reveal(&dir);
                     }
                 });
@@ -411,7 +480,9 @@ impl TimesheetApp {
                     ui.colored_label(ui.visuals().error_fg_color, err);
                 }
             });
-        self.show_settings = open;
+        if close {
+            self.show_settings = false;
+        }
         if let Some(dir) = new_dir {
             self.set_data_dir(dir);
         }
@@ -426,48 +497,67 @@ impl TimesheetApp {
     fn side_panel(&mut self, ui: &mut egui::Ui) {
         let dates = self.week_dates();
 
+        // Laid out first so the project list gets whatever height is left.
+        egui::Panel::bottom("week_summary")
+            .frame(egui::Frame::NONE)
+            .show_separator_line(false)
+            .show(ui, |ui| self.week_summary(ui, &dates));
+
         ui.heading("Projects");
         ui.add_space(4.0);
 
-        ui.horizontal(|ui| {
-            let resp = ui.add(
-                egui::TextEdit::singleline(&mut self.new_project_name)
-                    .hint_text("New project…")
-                    .desired_width(ui.available_width() - 50.0),
-            );
-            let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if (ui.button("Add").clicked() || enter) && !self.new_project_name.trim().is_empty() {
-                let id = self
-                    .data
-                    .add_project(self.new_project_name.trim().to_owned());
-                self.new_project_name.clear();
-                self.tool = Some(Tool::Paint(id));
-                if enter {
-                    resp.request_focus();
+        // Right to left so the text field takes whatever width the button leaves.
+        let row = Vec2::new(ui.available_width(), widgets::HEIGHT);
+        ui.allocate_ui_with_layout(
+            row,
+            egui::Layout::right_to_left(egui::Align::Center),
+            |ui| {
+                let add = button(ui, "Add").clicked();
+                let resp = text_field(ui, &mut self.new_project_name, "New project…");
+                let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if (add || enter) && !self.new_project_name.trim().is_empty() {
+                    let id = self
+                        .data
+                        .add_project(self.new_project_name.trim().to_owned());
+                    self.new_project_name.clear();
+                    self.tool = Some(Tool::Paint(id));
+                    if enter {
+                        resp.request_focus();
+                    }
                 }
-            }
-        });
+            },
+        );
         ui.add_space(6.0);
 
-        let eraser = ui.selectable_label(self.tool == Some(Tool::Erase), "⌫  Eraser");
+        let eraser = ui.selectable_label(
+            self.tool == Some(Tool::Erase),
+            format!("{ERASER_ICON}  Eraser"),
+        );
         if eraser.clicked() {
             self.tool = toggle(self.tool, Tool::Erase);
         }
         ui.separator();
 
+        let week_slots: Vec<usize> = self
+            .data
+            .projects
+            .iter()
+            .map(|p| {
+                dates
+                    .iter()
+                    .map(|d| self.data.project_slots(*d, p.id))
+                    .sum()
+            })
+            .collect();
         let mut delete = None;
         egui::ScrollArea::vertical()
             .id_salt("projects")
-            .max_height(ui.available_height() - 140.0)
             .auto_shrink([false, true])
             .show(ui, |ui| {
-                for (i, project) in self.data.projects.iter_mut().enumerate() {
+                for (i, (project, slots)) in
+                    self.data.projects.iter_mut().zip(week_slots).enumerate()
+                {
                     let id = project.id;
-                    let slots = dates
-                        .iter()
-                        .filter_map(|d| self.data.days.get(d))
-                        .map(|d| d.iter().filter(|s| **s == Some(id)).count())
-                        .sum::<usize>();
                     let selected = self.tool == Some(Tool::Paint(id));
                     let row = ui.horizontal(|ui| {
                         ui.color_edit_button_srgb(&mut project.color);
@@ -476,14 +566,11 @@ impl TimesheetApp {
                         } else {
                             project.name.clone()
                         };
-                        let resp = ui.add(
+                        ui.add(
                             egui::Button::selectable(selected, label)
-                                .min_size(Vec2::new(ui.available_width() - 60.0, 0.0)),
-                        );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(hours(slots));
-                        });
-                        resp
+                                .right_text(hours(slots))
+                                .min_size(Vec2::new(ui.available_width(), 0.0)),
+                        )
                     });
                     let resp = row.inner;
                     if resp.clicked() {
@@ -509,51 +596,56 @@ impl TimesheetApp {
                 self.tool = None;
             }
         }
+    }
 
-        // Week summary pinned to the bottom of the panel.
-        ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-            ui.add_space(6.0);
-            let total: usize = dates.iter().map(|d| self.data.filled_slots(*d)).sum();
-            let total_h = total as f32 / 4.0;
-            let remaining = WEEK_TARGET_HOURS - total_h;
-            ui.add(
-                egui::ProgressBar::new((total_h / WEEK_TARGET_HOURS).min(1.0))
-                    .text(format!("{total_h:.2} / {WEEK_TARGET_HOURS:.0} h")),
+    /// Hint text and the week's progress, pinned to the bottom of the side panel.
+    fn week_summary(&self, ui: &mut egui::Ui, dates: &[NaiveDate]) {
+        ui.weak("Left-drag: paint · Right-drag: erase\nKeys 1 to 9: pick project · Esc: drop tool");
+        ui.separator();
+        ui.add_space(4.0);
+
+        let total_h = slots_to_hours(dates.iter().map(|d| self.data.filled_slots(*d)).sum());
+        let remaining = WEEK_TARGET_HOURS - total_h;
+        let mut track = ProgressTrack::new(total_h / WEEK_TARGET_HOURS).labels(
+            "This week",
+            format!("{total_h:.2} / {WEEK_TARGET_HOURS:.0} h"),
+        );
+        if remaining < 0.0 {
+            track = track.color(ui.visuals().warn_fg_color);
+        }
+        ui.add(track);
+        ui.add_space(4.0);
+        if remaining >= 0.0 {
+            ui.weak(format!("{remaining:.2} h remaining"));
+        } else {
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                format!("{:.2} h overtime", -remaining),
             );
-            if remaining >= 0.0 {
-                ui.label(format!("Remaining: {remaining:.2} h"));
-            } else {
-                ui.colored_label(
-                    ui.visuals().warn_fg_color,
-                    format!("Overtime: {:.2} h", -remaining),
-                );
-            }
-            ui.strong(format!("Week total: {total_h:.2} h"));
-            ui.separator();
-            ui.weak("Left-drag: paint · Right-drag: erase\n1–9: pick project · Esc: drop tool");
-        });
+        }
+        ui.add_space(6.0);
     }
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            if ui.button("◀").clicked() {
+            if ui.add(FlatButton::icon("◀")).clicked() {
                 self.week_start -= Duration::days(7);
             }
-            if ui.button("Today").clicked() {
+            if button(ui, "Today").clicked() {
                 self.week_start = monday_of(Local::now().date_naive());
                 self.center_on_now = true;
             }
-            if ui.button("▶").clicked() {
+            if ui.add(FlatButton::icon("▶")).clicked() {
                 self.week_start += Duration::days(7);
             }
             let end = self.week_start + Duration::days(6);
             ui.strong(format!(
-                "{} – {}",
+                "{} to {}",
                 self.week_start.format("%b %-d"),
                 end.format("%b %-d, %Y")
             ));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("⚙ Settings").clicked() {
+                if button(ui, "⚙ Settings").clicked() {
                     self.show_settings = !self.show_settings;
                 }
                 if let Some(err) = &self.error {
@@ -661,11 +753,11 @@ impl TimesheetApp {
                     Pos2::new(rect.left() + GUTTER_W + i as f32 * col_w, y),
                     Vec2::new(col_w, ROW_H),
                 );
-                let value = format!("{:.2}", *slots as f32 / 4.0);
+                let value = format!("{:.2}", slots_to_hours(*slots));
                 let resp = ui
                     .interact(cell, Id::new(("breakdown", project.id, i)), Sense::click())
                     .on_hover_cursor(CursorIcon::PointingHand)
-                    .on_hover_text(format!("{} — click to copy {value}", project.name));
+                    .on_hover_text(format!("{}: click to copy {value}", project.name));
                 if resp.hovered() {
                     painter.rect_filled(
                         cell.shrink(1.0),
@@ -703,100 +795,124 @@ impl TimesheetApp {
     }
 
     fn grid(&mut self, ui: &mut egui::Ui, col_w: f32) {
-        let height = SLOTS_PER_DAY as f32 * ROW_H;
         let (rect, resp) = ui.allocate_exact_size(
-            Vec2::new(ui.available_width(), height),
+            Vec2::new(ui.available_width(), SLOTS_PER_DAY as f32 * ROW_H),
             Sense::click_and_drag(),
         );
+        let geom = GridGeom { rect, col_w };
         let dates = self.week_dates();
-        let grid_left = rect.left() + GUTTER_W;
-        let cell_at = |pos: Pos2| -> (usize, usize) {
-            let col = ((pos.x - grid_left) / col_w).floor().clamp(0.0, 6.0) as usize;
-            let row = ((pos.y - rect.top()) / ROW_H)
-                .floor()
-                .clamp(0.0, SLOTS_PER_DAY as f32 - 1.0) as usize;
-            (col, row)
-        };
+        self.handle_painting(ui, &resp, geom, &dates);
 
-        // --- Painting interaction ---
-        let pointer = ui.input(|i| i.pointer.interact_pos());
-        let (primary, secondary) =
-            ui.input(|i| (i.pointer.primary_down(), i.pointer.secondary_down()));
-        if resp.is_pointer_button_down_on() && (primary || secondary) {
-            if let Some(pos) = pointer {
-                let (col, row) = cell_at(pos);
-                if self.stroke.is_none() && pos.x >= grid_left {
-                    let current = self.data.slot(dates[col], row);
-                    let value = if secondary {
-                        Some(None)
-                    } else {
-                        match self.tool {
-                            // Starting a stroke on the same project toggles it off.
-                            Some(Tool::Paint(id)) if current == Some(id) => Some(None),
-                            Some(Tool::Paint(id)) => Some(Some(id)),
-                            Some(Tool::Erase) => Some(None),
-                            None => {
-                                // Eyedropper: clicking a block with no tool picks its project
-                                // (and keeps painting it if you drag).
-                                current.map(|id| {
-                                    self.tool = Some(Tool::Paint(id));
-                                    Some(id)
-                                })
-                            }
-                        }
-                    };
-                    if let Some(value) = value {
-                        self.stroke = Some(PaintStroke {
-                            value,
-                            last: (col, row),
-                        });
-                        self.data.set_slot(dates[col], row, value);
-                    }
-                }
-                if let Some(stroke) = &mut self.stroke {
-                    // Fill every cell between the last and current position so fast drags leave no gaps.
-                    let (c0, r0) = (stroke.last.0 as f32, stroke.last.1 as f32);
-                    let steps = (col as f32 - c0).abs().max((row as f32 - r0).abs()) as usize;
-                    for s in 1..=steps {
-                        let t = s as f32 / steps as f32;
-                        let c = (c0 + (col as f32 - c0) * t).round() as usize;
-                        let r = (r0 + (row as f32 - r0) * t).round() as usize;
-                        self.data.set_slot(dates[c], r, stroke.value);
-                    }
-                    stroke.last = (col, row);
-                }
+        let painter = ui.painter_at(rect);
+        self.draw_background(ui, &painter, geom);
+        self.draw_blocks(&painter, geom, &dates);
 
-                // Auto-scroll while dragging past the visible edge.
-                let clip = ui.clip_rect();
-                if pos.y > clip.bottom() - 10.0 {
-                    ui.scroll_with_delta(Vec2::new(0.0, -(pos.y - clip.bottom() + 10.0)));
-                } else if pos.y < clip.top() + 10.0 {
-                    ui.scroll_with_delta(Vec2::new(0.0, clip.top() + 10.0 - pos.y));
-                }
-            }
-        } else {
-            self.stroke = None;
+        // Hover highlight + tool indicator on the cursor.
+        if let Some(pos) = resp.hover_pos().filter(|p| p.x >= geom.left()) {
+            let (col, row) = geom.cell_at(pos);
+            painter.rect_stroke(
+                geom.cells(col, row..row + 1),
+                2.0,
+                Stroke::new(1.5, ui.visuals().strong_text_color()),
+                StrokeKind::Inside,
+            );
+            self.cursor_badge(ui, pos, row);
         }
 
-        // --- Drawing ---
-        let painter = ui.painter_at(rect);
-        let visuals = ui.visuals();
-        let line_faint = visuals
-            .widgets
-            .noninteractive
-            .bg_stroke
-            .color
-            .gamma_multiply(0.35);
-        let line_hour = visuals.widgets.noninteractive.bg_stroke.color;
-        let text_weak = visuals.weak_text_color();
+        // Current time line.
+        if let Some(col) = dates.iter().position(|d| *d == Local::now().date_naive()) {
+            let y = rect.top() + minutes_to_y(now_minutes());
+            let x0 = geom.col_x(col);
+            let red = Color32::from_rgb(0xe0, 0x3c, 0x31);
+            painter.hline(x0..=x0 + col_w, y, Stroke::new(2.0, red));
+            painter.circle_filled(Pos2::new(x0, y), 4.0, red);
+        }
+    }
 
-        // Off-hours shading and time labels.
+    /// Left-drag paints with the current tool, right-drag erases.
+    fn handle_painting(
+        &mut self,
+        ui: &egui::Ui,
+        resp: &egui::Response,
+        geom: GridGeom,
+        dates: &[NaiveDate],
+    ) {
+        let (primary, secondary) =
+            ui.input(|i| (i.pointer.primary_down(), i.pointer.secondary_down()));
+        if !(resp.is_pointer_button_down_on() && (primary || secondary)) {
+            self.stroke = None;
+            return;
+        }
+        let Some(pos) = ui.input(|i| i.pointer.interact_pos()) else {
+            return;
+        };
+        let (col, row) = geom.cell_at(pos);
+        if self.stroke.is_none() && pos.x >= geom.left() {
+            let current = self.data.slot(dates[col], row);
+            self.stroke = self.start_stroke(current, secondary, (col, row));
+            if let Some(stroke) = &self.stroke {
+                self.data.set_slot(dates[col], row, stroke.value);
+            }
+        }
+        if let Some(stroke) = &mut self.stroke {
+            // Fill every cell between the last and current position so fast drags leave no gaps.
+            let (c0, r0) = (stroke.last.0 as f32, stroke.last.1 as f32);
+            let steps = (col as f32 - c0).abs().max((row as f32 - r0).abs()) as usize;
+            for s in 1..=steps {
+                let t = s as f32 / steps as f32;
+                let c = (c0 + (col as f32 - c0) * t).round() as usize;
+                let r = (r0 + (row as f32 - r0) * t).round() as usize;
+                self.data.set_slot(dates[c], r, stroke.value);
+            }
+            stroke.last = (col, row);
+        }
+
+        // Auto-scroll while dragging past the visible edge.
+        let clip = ui.clip_rect();
+        if pos.y > clip.bottom() - 10.0 {
+            ui.scroll_with_delta(Vec2::new(0.0, -(pos.y - clip.bottom() + 10.0)));
+        } else if pos.y < clip.top() + 10.0 {
+            ui.scroll_with_delta(Vec2::new(0.0, clip.top() + 10.0 - pos.y));
+        }
+    }
+
+    /// Decides what a drag starting on a slot holding `current` will paint.
+    /// Returns `None` when the click should do nothing.
+    fn start_stroke(
+        &mut self,
+        current: Option<u64>,
+        erase: bool,
+        at: (usize, usize),
+    ) -> Option<PaintStroke> {
+        let value = match (erase, self.tool) {
+            (true, _) | (false, Some(Tool::Erase)) => None,
+            // Starting a stroke on the same project toggles it off.
+            (false, Some(Tool::Paint(id))) if current == Some(id) => None,
+            (false, Some(Tool::Paint(id))) => Some(id),
+            // Eyedropper: clicking a block with no tool picks its project (and keeps
+            // painting it if you drag). Clicking an empty slot does nothing.
+            (false, None) => {
+                let id = current?;
+                self.tool = Some(Tool::Paint(id));
+                Some(id)
+            }
+        };
+        Some(PaintStroke { value, last: at })
+    }
+
+    /// Off-hours shading, hour labels, and grid lines.
+    fn draw_background(&self, ui: &egui::Ui, painter: &egui::Painter, geom: GridGeom) {
+        let visuals = ui.visuals();
+        let line_hour = visuals.widgets.noninteractive.bg_stroke.color;
+        let line_faint = line_hour.gamma_multiply(0.35);
+        let rect = geom.rect;
+
         for hour in 0..24 {
             let y = rect.top() + hour as f32 * 4.0 * ROW_H;
             if !(9..17).contains(&hour) {
                 painter.rect_filled(
                     Rect::from_min_max(
-                        Pos2::new(grid_left, y),
+                        Pos2::new(geom.left(), y),
                         Pos2::new(rect.right(), y + 4.0 * ROW_H),
                     ),
                     0.0,
@@ -804,35 +920,30 @@ impl TimesheetApp {
                 );
             }
             painter.text(
-                Pos2::new(grid_left - 6.0, y + 2.0),
+                Pos2::new(geom.left() - 6.0, y + 2.0),
                 Align2::RIGHT_TOP,
-                if self.settings.clock_24h {
-                    format!("{hour:02}:00")
-                } else {
-                    clock(hour * 60, false).replace(":00", "")
-                },
+                hour_label(hour, self.settings.clock_24h),
                 FontId::monospace(11.0),
-                text_weak,
+                visuals.weak_text_color(),
             );
         }
 
-        // Grid lines, drawn under the blocks so they don't cut through them.
         for slot in 0..=SLOTS_PER_DAY {
             let y = rect.top() + slot as f32 * ROW_H;
             let color = if slot % 4 == 0 { line_hour } else { line_faint };
-            painter.hline(grid_left..=rect.right(), y, Stroke::new(1.0, color));
+            painter.hline(geom.left()..=rect.right(), y, Stroke::new(1.0, color));
         }
         for col in 0..=7 {
-            let x = grid_left + col as f32 * col_w;
-            painter.vline(x, rect.y_range(), Stroke::new(1.0, line_hour));
+            painter.vline(geom.col_x(col), rect.y_range(), Stroke::new(1.0, line_hour));
         }
+    }
 
-        // Project blocks, merged into contiguous runs so labels show once.
+    /// Project blocks, merged into contiguous runs so labels show once.
+    fn draw_blocks(&self, painter: &egui::Painter, geom: GridGeom, dates: &[NaiveDate]) {
         for (col, date) in dates.iter().enumerate() {
             let Some(day) = self.data.days.get(date) else {
                 continue;
             };
-            let x = grid_left + col as f32 * col_w;
             let mut row = 0;
             while row < SLOTS_PER_DAY {
                 let Some(id) = day[row] else {
@@ -846,11 +957,7 @@ impl TimesheetApp {
                 let Some(project) = self.data.project(id) else {
                     continue;
                 };
-                let block = Rect::from_min_size(
-                    Pos2::new(x, rect.top() + start as f32 * ROW_H),
-                    Vec2::new(col_w, (row - start) as f32 * ROW_H),
-                )
-                .shrink2(Vec2::new(2.0, 1.0));
+                let block = geom.cells(col, start..row).shrink2(Vec2::new(2.0, 1.0));
                 let color = project.color32();
                 painter.rect(
                     block,
@@ -859,102 +966,100 @@ impl TimesheetApp {
                     Stroke::new(1.0, border_color_for(color)),
                     StrokeKind::Inside,
                 );
-                painter.with_clip_rect(block.intersect(rect)).text(
-                    block.left_top() + Vec2::new(4.0, 2.0),
-                    Align2::LEFT_TOP,
-                    format!("{}  {}", project.name, hours(row - start)),
-                    FontId::proportional(11.0),
-                    text_color_for(color),
-                );
-            }
-        }
-
-        // Hover highlight + tool indicator on the cursor.
-        if let Some(pos) = resp.hover_pos().filter(|p| p.x >= grid_left) {
-            let (col, row) = cell_at(pos);
-            let cell = Rect::from_min_size(
-                Pos2::new(
-                    grid_left + col as f32 * col_w,
-                    rect.top() + row as f32 * ROW_H,
-                ),
-                Vec2::new(col_w, ROW_H),
-            );
-            painter.rect_stroke(
-                cell,
-                2.0,
-                Stroke::new(1.5, visuals.strong_text_color()),
-                StrokeKind::Inside,
-            );
-            let time = clock(row * 15, self.settings.clock_24h);
-            let fg = ui
-                .ctx()
-                .layer_painter(LayerId::new(Order::Tooltip, Id::new("cursor")));
-            let badge = match self.tool {
-                Some(Tool::Paint(id)) => self
-                    .data
-                    .project(id)
-                    .map(|p| (Some(p.color32()), format!("{}  {time}", p.name))),
-                Some(Tool::Erase) => Some((None, format!("⌫  {time}"))),
-                None => None,
-            };
-            if let Some((swatch, label)) = badge {
-                ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
-                let galley = fg.layout_no_wrap(
-                    label,
-                    FontId::proportional(12.0),
-                    visuals.strong_text_color(),
-                );
-                let pad = Vec2::new(6.0, 4.0);
-                let swatch_w = if swatch.is_some() { 16.0 } else { 0.0 };
-                let size = galley.size() + Vec2::new(swatch_w, 0.0) + pad * 2.0;
-                // Sit below-right of the cursor, flipping to stay on screen.
-                let screen = ui.ctx().content_rect();
-                let mut min = pos + Vec2::new(14.0, 14.0);
-                if min.x + size.x > screen.right() {
-                    min.x = pos.x - 14.0 - size.x;
-                }
-                if min.y + size.y > screen.bottom() {
-                    min.y = pos.y - 14.0 - size.y;
-                }
-                let bg = Rect::from_min_size(min, size);
-                fg.add(
-                    visuals
-                        .popup_shadow
-                        .as_shape(bg, visuals.menu_corner_radius),
-                );
-                fg.rect(
-                    bg,
-                    visuals.menu_corner_radius,
-                    visuals.window_fill,
-                    visuals.window_stroke,
-                    StrokeKind::Outside,
-                );
-                if let Some(color) = swatch {
-                    fg.circle(
-                        Pos2::new(bg.left() + pad.x + 6.0, bg.center().y),
-                        6.0,
-                        color,
-                        Stroke::new(1.0, visuals.strong_text_color()),
+                // Name on top with the duration under it; a single slot fits only one line.
+                let clip = painter.with_clip_rect(block.shrink(1.0).intersect(geom.rect));
+                let fg = text_color_for(color);
+                let duration = hours(row - start);
+                if row - start == 1 {
+                    clip.text(
+                        Pos2::new(block.left() + 6.0, block.center().y),
+                        Align2::LEFT_CENTER,
+                        format!("{}  {duration}", project.name),
+                        FontId::proportional(12.0),
+                        fg,
+                    );
+                } else {
+                    let name = clip.text(
+                        block.left_top() + Vec2::new(6.0, 3.0),
+                        Align2::LEFT_TOP,
+                        &project.name,
+                        FontId::proportional(13.5),
+                        fg,
+                    );
+                    clip.text(
+                        Pos2::new(block.left() + 6.0, name.bottom()),
+                        Align2::LEFT_TOP,
+                        duration,
+                        FontId::proportional(12.0),
+                        fg.gamma_multiply(0.75),
                     );
                 }
-                fg.galley(
-                    bg.min + pad + Vec2::new(swatch_w, 0.0),
-                    galley,
-                    visuals.strong_text_color(),
-                );
             }
         }
+    }
 
-        // Current time line.
-        let now = Local::now();
-        if let Some(col) = dates.iter().position(|d| *d == now.date_naive()) {
-            let mins = now.hour() as f32 * 60.0 + now.minute() as f32;
-            let y = rect.top() + mins / 15.0 * ROW_H;
-            let x0 = grid_left + col as f32 * col_w;
-            let red = Color32::from_rgb(0xe0, 0x3c, 0x31);
-            painter.hline(x0..=x0 + col_w, y, Stroke::new(2.0, red));
-            painter.circle_filled(Pos2::new(x0, y), 4.0, red);
+    /// A small label next to the cursor showing the active tool and the hovered time.
+    fn cursor_badge(&self, ui: &egui::Ui, pos: Pos2, row: usize) {
+        let time = clock(row * 15, self.settings.clock_24h);
+        let (swatch, label) = match self.tool {
+            Some(Tool::Paint(id)) => {
+                let Some(p) = self.data.project(id) else {
+                    return;
+                };
+                (Some(p.color32()), format!("{}  {time}", p.name))
+            }
+            Some(Tool::Erase) => (None, format!("{ERASER_ICON}  {time}")),
+            None => return,
+        };
+
+        ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
+        let visuals = ui.visuals();
+        let fg = ui
+            .ctx()
+            .layer_painter(LayerId::new(Order::Tooltip, Id::new("cursor")));
+        let galley = fg.layout_no_wrap(
+            label,
+            FontId::proportional(12.0),
+            visuals.strong_text_color(),
+        );
+        let pad = Vec2::new(6.0, 4.0);
+        let swatch_w = if swatch.is_some() { 16.0 } else { 0.0 };
+        let size = galley.size() + Vec2::new(swatch_w, 0.0) + pad * 2.0;
+        // Sit below-right of the cursor, flipping to stay on screen.
+        let screen = ui.ctx().content_rect();
+        let mut min = pos + Vec2::new(14.0, 14.0);
+        if min.x + size.x > screen.right() {
+            min.x = pos.x - 14.0 - size.x;
         }
+        if min.y + size.y > screen.bottom() {
+            min.y = pos.y - 14.0 - size.y;
+        }
+        let bg = Rect::from_min_size(min, size);
+        fg.add(
+            visuals
+                .popup_shadow
+                .as_shape(bg, visuals.menu_corner_radius),
+        );
+        fg.rect(
+            bg,
+            visuals.menu_corner_radius,
+            visuals.window_fill,
+            visuals.window_stroke,
+            StrokeKind::Outside,
+        );
+        if let Some(color) = swatch {
+            fg.circle(
+                Pos2::new(bg.left() + pad.x + 6.0, bg.center().y),
+                6.0,
+                color,
+                Stroke::new(1.0, visuals.strong_text_color()),
+            );
+        }
+        fg.galley(
+            bg.min + pad + Vec2::new(swatch_w, 0.0),
+            galley,
+            visuals.strong_text_color(),
+        );
     }
 }
 
@@ -987,10 +1092,10 @@ impl eframe::App for TimesheetApp {
                 egui::Key::Num9,
             ];
             for (n, key) in keys.iter().enumerate() {
-                if ui.input(|i| i.key_pressed(*key)) {
-                    if let Some(p) = self.data.projects.get(n) {
-                        self.tool = Some(Tool::Paint(p.id));
-                    }
+                if ui.input(|i| i.key_pressed(*key))
+                    && let Some(p) = self.data.projects.get(n)
+                {
+                    self.tool = Some(Tool::Paint(p.id));
                 }
             }
         }
@@ -1022,11 +1127,9 @@ impl eframe::App for TimesheetApp {
                 });
             if self.center_on_now {
                 self.center_on_now = false;
-                let now = Local::now();
-                let mins = now.hour() as f32 * 60.0 + now.minute() as f32;
                 let total = SLOTS_PER_DAY as f32 * ROW_H;
-                let offset =
-                    (mins / 15.0 * ROW_H - grid_h / 2.0).clamp(0.0, (total - grid_h).max(0.0));
+                let offset = (minutes_to_y(now_minutes()) - grid_h / 2.0)
+                    .clamp(0.0, (total - grid_h).max(0.0));
                 area = area.vertical_scroll_offset(offset);
             }
             area.show(ui, |ui| self.grid(ui, col_w));
@@ -1067,7 +1170,7 @@ fn main() -> eframe::Result {
 
 #[cfg(test)]
 mod tests {
-    use super::clock;
+    use super::{clock, hour_label};
 
     #[test]
     fn clock_formats() {
@@ -1077,5 +1180,14 @@ mod tests {
         assert_eq!(clock(9 * 60 + 15, false), "9:15 AM");
         assert_eq!(clock(12 * 60, false), "12:00 PM");
         assert_eq!(clock(23 * 60 + 45, false), "11:45 PM");
+    }
+
+    #[test]
+    fn hour_labels() {
+        assert_eq!(hour_label(0, true), "00:00");
+        assert_eq!(hour_label(14, true), "14:00");
+        assert_eq!(hour_label(0, false), "12 AM");
+        assert_eq!(hour_label(12, false), "12 PM");
+        assert_eq!(hour_label(23, false), "11 PM");
     }
 }

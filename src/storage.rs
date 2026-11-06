@@ -80,6 +80,11 @@ pub fn backup_path(dir: &Path) -> PathBuf {
     dir.join("timesheet.backup.json")
 }
 
+/// Where a data file that failed to parse is moved, so it's kept for inspection.
+pub fn damaged_path(dir: &Path, stamp: &str) -> PathBuf {
+    dir.join(format!("timesheet.damaged-{stamp}.json"))
+}
+
 /// Returns `Ok(None)` if the file doesn't exist.
 /// A file that exists but isn't valid JSON is reported as [`io::ErrorKind::InvalidData`].
 pub fn read_json<T: DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {
